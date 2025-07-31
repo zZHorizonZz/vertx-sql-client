@@ -1,0 +1,2 @@
+io.vertx.sqldsl.generator.MetamodelGenLoader
+io.vertx.sqldsl.generator.RowMapperGenLoader
