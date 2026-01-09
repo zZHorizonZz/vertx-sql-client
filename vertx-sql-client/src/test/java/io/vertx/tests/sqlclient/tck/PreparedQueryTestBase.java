@@ -11,6 +11,7 @@
 package io.vertx.tests.sqlclient.tck;
 
 import io.vertx.core.AsyncResult;
+import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
 import io.vertx.ext.unit.Async;
@@ -37,21 +38,6 @@ public abstract class PreparedQueryTestBase {
   protected SqlConnectOptions options;
 
   protected Consumer<Throwable> msgVerifier;
-
-  private static void insertIntoTestTable(TestContext ctx, SqlClient client, int amount, Runnable completionHandler) {
-    AtomicInteger count = new AtomicInteger();
-    for (int i = 0; i < 10; i++) {
-      client
-        .query("INSERT INTO mutable (id, val) VALUES (" + i + ", 'Whatever-" + i + "')")
-        .execute()
-        .onComplete(ctx.asyncAssertSuccess(r1 -> {
-        ctx.assertEquals(1, r1.rowCount());
-        if (count.incrementAndGet() == amount) {
-          completionHandler.run();
-        }
-      }));
-    }
-  }
 
   protected void connect(Handler<AsyncResult<SqlConnection>> handler) {
     connector.connect(handler);
@@ -262,23 +248,51 @@ public abstract class PreparedQueryTestBase {
       conn
         .prepare(statement("SELECT * FROM immutable WHERE id=", " OR id=", " OR id=", " OR id=", " OR id=", " OR id=", ""))
         .onComplete(ctx.asyncAssertSuccess(ps -> {
-        Cursor query = ps.cursor(Tuple.of(1, 8, 4, 11, 2, 9));
-        query
-          .read(4)
-          .onComplete(ctx.asyncAssertSuccess(result -> {
-          ctx.assertNotNull(result.columnsNames());
-          ctx.assertEquals(4, result.size());
-          ctx.assertTrue(query.hasMore());
-          query
+          Cursor cursor = ps.cursor(Tuple.of(1, 8, 4, 11, 2, 9));
+          ctx.assertNull(cursor.rowDescriptor());
+          cursor
             .read(4)
-            .onComplete(ctx.asyncAssertSuccess(result2 -> {
-            ctx.assertNotNull(result2.columnsNames());
-            ctx.assertEquals(2, result2.size());
-            ctx.assertFalse(query.hasMore());
-            async.complete();
-          }));
+            .onComplete(ctx.asyncAssertSuccess(result -> {
+              ctx.assertNotNull(result.columnsNames());
+              ctx.assertNotNull(cursor.rowDescriptor());
+              ctx.assertEquals(result.columnsNames(), cursor.rowDescriptor().columnNames());
+              ctx.assertEquals(4, result.size());
+              ctx.assertTrue(cursor.hasMore());
+              cursor
+                .read(4)
+                .onComplete(ctx.asyncAssertSuccess(result2 -> {
+                  ctx.assertNotNull(result2.columnsNames());
+                  ctx.assertNotNull(cursor.rowDescriptor());
+                  ctx.assertEquals(result2.columnsNames(), cursor.rowDescriptor().columnNames());
+                  ctx.assertEquals(2, result2.size());
+                  ctx.assertFalse(cursor.hasMore());
+                  async.complete();
+                }));
+            }));
         }));
-      }));
+    });
+  }
+
+  @Test
+  public void testQueryCursorNoResults(TestContext ctx) {
+    Async async = ctx.async();
+    testCursor(ctx, conn -> {
+      conn
+        .prepare("SELECT * FROM immutable WHERE 1=3")
+        .onComplete(ctx.asyncAssertSuccess(ps -> {
+          Cursor cursor = ps.cursor(Tuple.tuple());
+          ctx.assertNull(cursor.rowDescriptor());
+          cursor
+            .read(99)
+            .onComplete(ctx.asyncAssertSuccess(result -> {
+              ctx.assertNotNull(result.columnsNames());
+              ctx.assertNotNull(cursor.rowDescriptor());
+              ctx.assertEquals(result.columnsNames(), cursor.rowDescriptor().columnNames());
+              ctx.assertEquals(0, result.size());
+              ctx.assertFalse(cursor.hasMore());
+              async.complete();
+            }));
+        }));
     });
   }
 
@@ -302,6 +316,19 @@ public abstract class PreparedQueryTestBase {
           }));
         }));
       }));
+    });
+  }
+
+  @Test
+  public void testQueryCloseCursorTwice(TestContext ctx) {
+    Async async = ctx.async();
+    testCursor(ctx, conn -> {
+      conn
+        .prepare("SELECT * FROM immutable")
+        .onComplete(ctx.asyncAssertSuccess(ps -> {
+          Cursor cursor = ps.cursor(Tuple.tuple());
+          Future.all(cursor.close(), cursor.close()).onComplete(ctx.asyncAssertSuccess(v -> async.complete()));
+        }));
     });
   }
 
@@ -337,10 +364,12 @@ public abstract class PreparedQueryTestBase {
     testCursor(ctx, conn -> {
       conn.prepare("SELECT * FROM immutable").onComplete(ctx.asyncAssertSuccess(ps -> {
         RowStream<Row> stream = ps.createStream(4, Tuple.tuple());
+        ctx.assertNull(stream.rowDescriptor());
         List<Tuple> rows = new ArrayList<>();
         AtomicInteger ended = new AtomicInteger();
         stream.handler(tuple -> {
           ctx.assertEquals(0, ended.get());
+          ctx.assertNotNull(stream.rowDescriptor());
           rows.add(tuple);
         });
         Cursor cursor = ((RowStreamInternal) stream).cursor();
@@ -349,6 +378,24 @@ public abstract class PreparedQueryTestBase {
           ctx.assertEquals(0, ended.getAndIncrement());
           ctx.assertEquals(12, rows.size());
           async.complete();
+        });
+      }));
+    });
+  }
+
+  @Test
+  public void testStreamQueryNoResults(TestContext ctx) {
+    Async async = ctx.async();
+    testCursor(ctx, conn -> {
+      conn.prepare("SELECT * FROM immutable WHERE 1=3").onComplete(ctx.asyncAssertSuccess(ps -> {
+        RowStream<Row> stream = ps.createStream(99, Tuple.tuple());
+        ctx.assertNull(stream.rowDescriptor());
+        stream.endHandler(v -> {
+          ctx.assertNotNull(stream.rowDescriptor());
+          async.complete();
+        });
+        stream.handler(tuple -> {
+          ctx.fail("Should not get here");
         });
       }));
     });

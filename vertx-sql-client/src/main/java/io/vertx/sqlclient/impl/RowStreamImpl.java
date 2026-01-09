@@ -17,16 +17,12 @@
 
 package io.vertx.sqlclient.impl;
 
-import io.vertx.core.Future;
-import io.vertx.core.internal.ContextInternal;
-import io.vertx.sqlclient.Cursor;
-import io.vertx.sqlclient.RowIterator;
-import io.vertx.sqlclient.RowSet;
-import io.vertx.sqlclient.RowStream;
-import io.vertx.sqlclient.Row;
-import io.vertx.sqlclient.Tuple;
 import io.vertx.core.AsyncResult;
+import io.vertx.core.Future;
 import io.vertx.core.Handler;
+import io.vertx.core.internal.ContextInternal;
+import io.vertx.sqlclient.*;
+import io.vertx.sqlclient.desc.RowDescriptor;
 
 import java.util.Iterator;
 
@@ -56,6 +52,11 @@ public class RowStreamImpl implements RowStreamInternal, Handler<AsyncResult<Row
 
   public synchronized Cursor cursor() {
     return cursor;
+  }
+
+  @Override
+  public synchronized RowDescriptor rowDescriptor() {
+    return cursor != null ? cursor.rowDescriptor() : null;
   }
 
   @Override
@@ -173,13 +174,13 @@ public class RowStreamImpl implements RowStreamInternal, Handler<AsyncResult<Row
       emitting = true;
     }
     while (true) {
+      Handler handler;
+      Object event;
       synchronized (RowStreamImpl.this) {
         if (demand == 0L) {
           emitting = false;
           break;
         }
-        Handler handler;
-        Object event;
         if (result != null) {
           handler = rowHandler;
           event = result.next();
@@ -202,8 +203,13 @@ public class RowStreamImpl implements RowStreamInternal, Handler<AsyncResult<Row
               break;
             } else {
               cursor.close();
-              cursor = null;
-              handler = endHandler;
+              Handler<Void> eh = endHandler;
+              handler = v -> {
+                eh.handle(null);
+                synchronized (RowStreamImpl.this) {
+                  cursor = null;
+                }
+              };
               event = null;
             }
           }

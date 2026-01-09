@@ -13,24 +13,24 @@ package io.vertx.sqlclient.impl.pool;
 
 import io.netty.channel.EventLoop;
 import io.vertx.core.*;
+import io.vertx.core.internal.ContextInternal;
 import io.vertx.core.internal.PromiseInternal;
+import io.vertx.core.internal.VertxInternal;
 import io.vertx.core.internal.net.NetSocketInternal;
+import io.vertx.core.internal.pool.*;
 import io.vertx.core.net.SocketAddress;
 import io.vertx.core.spi.metrics.ClientMetrics;
 import io.vertx.core.spi.metrics.PoolMetrics;
 import io.vertx.core.spi.tracing.VertxTracer;
 import io.vertx.core.tracing.TracingPolicy;
-import io.vertx.core.internal.pool.*;
-import io.vertx.core.internal.ContextInternal;
-import io.vertx.core.internal.VertxInternal;
 import io.vertx.sqlclient.SqlConnectOptions;
+import io.vertx.sqlclient.impl.tracing.QueryReporter;
+import io.vertx.sqlclient.spi.DatabaseMetadata;
 import io.vertx.sqlclient.spi.connection.Connection;
 import io.vertx.sqlclient.spi.connection.ConnectionContext;
+import io.vertx.sqlclient.spi.connection.ConnectionFactory;
 import io.vertx.sqlclient.spi.protocol.CommandBase;
 import io.vertx.sqlclient.spi.protocol.QueryCommandBase;
-import io.vertx.sqlclient.impl.tracing.QueryReporter;
-import io.vertx.sqlclient.spi.connection.ConnectionFactory;
-import io.vertx.sqlclient.spi.DatabaseMetadata;
 
 import java.util.List;
 import java.util.function.Function;
@@ -184,31 +184,75 @@ public class SqlConnectionPool {
     }
   }
 
+  private Object beginMetric() {
+    if (metrics != null) {
+      try {
+        return metrics.begin();
+      } catch (Exception e) {
+        //
+      }
+    }
+    return NO_METRICS;
+  }
+
+  private void endMetric(Object metric) {
+    if (metrics != null && metric != NO_METRICS) {
+      try {
+        metrics.end(metric);
+      } catch (Exception e) {
+        //
+      }
+    }
+  }
+
+  private static final Exception POOL_QUERY_TIMEOUT_EXCEPTION = new VertxException("Timeout waiting for connection", true);
+
   // TODO : try optimize without promise
-  public <R> void execute(CommandBase<R> cmd, Completable<R> handler) {
+  public <R> void execute(CommandBase<R> cmd, Completable<R> handler, long timeout) {
     ContextInternal context = vertx.getOrCreateContext();
     Promise<Lease<PooledConnection>> p = context.promise();
+    long timerId;
+    if (timeout > 0) {
+      timerId = vertx.setTimer(timeout, t -> handler.fail(POOL_QUERY_TIMEOUT_EXCEPTION));
+    } else {
+      timerId = -1;
+    }
     Object metric = enqueueMetric();
     pool.acquire(context, 0, p);
     p.future().compose(lease -> {
       dequeueMetric(metric);
       PooledConnection pooled = lease.get();
-      Connection conn = pooled.conn;
       Future<R> future;
-      if (afterAcquire != null) {
-        future = afterAcquire.apply(conn)
-          .compose(v -> Future.<R>future(d -> pooled.schedule(cmd, d)))
-          .eventually(() -> beforeRecycle.apply(conn));
+      if (timerId != -1 && !vertx.cancelTimer(timerId)) {
+        // We want to make sure the connection is released properly below
+        // But we don't want to record begin/end pool metrics
+        pooled.timerMetric = NO_METRICS;
+        future = Future.failedFuture(POOL_QUERY_TIMEOUT_EXCEPTION);
       } else {
-        PromiseInternal<R> pp = context.promise();
-        pooled.schedule(cmd, pp);
-        future = pp;
+        pooled.timerMetric = beginMetric();
+        if (afterAcquire != null) {
+          Connection conn = pooled.conn;
+          future = afterAcquire.apply(conn)
+            .compose(v -> Future.<R>future(d -> pooled.schedule(cmd, d)))
+            .eventually(() -> beforeRecycle.apply(conn));
+        } else {
+          PromiseInternal<R> pp = context.promise();
+          pooled.schedule(cmd, pp);
+          future = pp;
+        }
       }
       return future.andThen(ar -> {
+        endMetric(pooled.timerMetric);
         pooled.refresh();
         lease.recycle();
       });
-    }).onComplete(handler);
+    }).onComplete(ar -> {
+      if (ar.succeeded()) {
+        handler.succeed(ar.result());
+      } else if (!POOL_QUERY_TIMEOUT_EXCEPTION.equals(ar.cause())) {
+        handler.fail(ar.cause());
+      }
+    });
   }
 
   public void acquire(ContextInternal context, long timeout, Completable<PooledConnection> handler) {
@@ -247,6 +291,7 @@ public class SqlConnectionPool {
       private void handle(Lease<PooledConnection> lease) {
         dequeueMetric(metric);
         PooledConnection pooled = lease.get();
+        pooled.timerMetric = beginMetric();
         pooled.lease = lease;
         handler.succeed(pooled);
       }
@@ -306,6 +351,7 @@ public class SqlConnectionPool {
     private ConnectionContext holder;
     private Promise<ConnectResult<PooledConnection>> poolCallback;
     private Lease<PooledConnection> lease;
+    private Object timerMetric;
     public long idleEvictionTimestamp;
     public long lifetimeEvictionTimestamp;
 
@@ -446,6 +492,7 @@ public class SqlConnectionPool {
     }
 
     private void cleanup(Completable<Void> promise) {
+      endMetric(timerMetric);
       Lease<PooledConnection> l = this.lease;
       this.lease = null;
       refresh();

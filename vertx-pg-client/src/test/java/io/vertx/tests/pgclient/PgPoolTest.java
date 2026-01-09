@@ -20,11 +20,11 @@ package io.vertx.tests.pgclient;
 import io.netty.channel.EventLoop;
 import io.vertx.core.Handler;
 import io.vertx.core.VertxOptions;
+import io.vertx.core.internal.ContextInternal;
 import io.vertx.ext.unit.Async;
 import io.vertx.ext.unit.TestContext;
 import io.vertx.ext.unit.junit.Repeat;
 import io.vertx.ext.unit.junit.RepeatRule;
-import io.vertx.core.internal.ContextInternal;
 import io.vertx.pgclient.PgBuilder;
 import io.vertx.pgclient.PgConnectOptions;
 import io.vertx.pgclient.PgConnection;
@@ -35,17 +35,14 @@ import io.vertx.tests.sqlclient.ProxyServer;
 import org.junit.Rule;
 import org.junit.Test;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collector;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
 import static java.util.stream.Collectors.mapping;
 import static java.util.stream.Collectors.toList;
 
@@ -281,7 +278,7 @@ public class PgPoolTest extends PgPoolTestBase {
 
   @Test
   public void testEventLoopSize(TestContext ctx) {
-    int num = VertxOptions.DEFAULT_EVENT_LOOP_POOL_SIZE;
+    int num = Math.min(VertxOptions.DEFAULT_EVENT_LOOP_POOL_SIZE, 50);
     int size = num * 2;
     Pool pool = PgBuilder.pool(b -> b.with(new PoolOptions().setMaxSize(size).setEventLoopSize(2)).connectingTo(options));
     Set<EventLoop> eventLoops = Collections.synchronizedSet(new HashSet<>());
@@ -616,6 +613,19 @@ public class PgPoolTest extends PgPoolTestBase {
         .getConnection()
         .onComplete(ctx.asyncAssertFailure(conn -> {
         async.countDown();
+      }));
+    }));
+  }
+
+  @Test
+  public void testPooledQueryTimeout(TestContext ctx) {
+    Async async = ctx.async();
+    PoolOptions poolOptions = new PoolOptions().setMaxSize(1).setConnectionTimeout(1).setConnectionTimeoutUnit(SECONDS);
+    Pool pool = createPool(options, poolOptions);
+    pool.getConnection().onComplete(ctx.asyncAssertSuccess(conn -> {
+      pool.query("SELECT 1").execute().onComplete(ctx.asyncAssertFailure(t -> {
+        conn.close();
+        async.complete();
       }));
     }));
   }
